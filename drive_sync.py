@@ -13,7 +13,7 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from googleapiclient.errors import HttpError
 import io
 
-# 权限和 MIME 映射保持不变
+# ... (SCOPES, MIME_TYPE_MAP, GOOGLE_DOC_EXPORT_MAP 保持不变) ...
 SCOPES = ['https://www.googleapis.com/auth/drive']
 MIME_TYPE_MAP = {
     'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'application/vnd.google-apps.document',
@@ -22,15 +22,11 @@ MIME_TYPE_MAP = {
     'text/plain': 'application/vnd.google-apps.document',
     'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'application/vnd.google-apps.presentation',
 }
-
-# *** 新增：Google Docs 导出格式映射 ***
-# 定义原生 Google 格式应该被导出为什么样的二进制格式
 GOOGLE_DOC_EXPORT_MAP = {
-    'application/vnd.google-apps.document': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', # Google Doc -> .docx
-    'application/vnd.google-apps.spreadsheet': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',  # Google Sheet -> .xlsx
-    'application/vnd.google-apps.presentation': 'application/vnd.openxmlformats-officedocument.presentationml.presentation', # Google Slides -> .pptx
+    'application/vnd.google-apps.document': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'application/vnd.google-apps.spreadsheet': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'application/vnd.google-apps.presentation': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
 }
-
 
 # --- 之前的辅助函数保持不变 ---
 def get_drive_service(credentials_path, token_path):
@@ -98,7 +94,18 @@ def get_default_config_dir():
         return os.path.expanduser('~/Library/Mobile Documents/com~apple~CloudDocs/AppConfig/drive-sync')
     else:
         return os.path.expanduser('~/.config/drive-sync')
-
+        
+# *** 新增一个辅助函数来处理文件创建，避免代码重复 ***
+def create_drive_file(service, local_file_path, file_name, parent_folder_id):
+    """上传并可能转换本地文件，返回创建的文件对象"""
+    media = MediaFileUpload(local_file_path, resumable=True)
+    file_metadata = {'name': file_name, 'parents': [parent_folder_id]}
+    if media.mimetype() in MIME_TYPE_MAP:
+        file_metadata['mimeType'] = MIME_TYPE_MAP[media.mimetype()]
+        print(f"  - 请求将文件转换为: {file_metadata['mimeType']}")
+    
+    uploaded_file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
+    return uploaded_file
 
 def main():
     """主执行函数"""
@@ -110,7 +117,8 @@ def main():
     parser.add_argument("--credentials-path", help="指定 credentials.json 文件的路径")
     parser.add_argument("--token-path", help="指定 token.json 文件的路径")
     args = parser.parse_args()
-
+    
+    # ... (路径和认证设置部分保持不变) ...
     default_config_dir = get_default_config_dir()
     os.makedirs(default_config_dir, exist_ok=True)
     credentials_path = args.credentials_path or os.path.join(default_config_dir, 'credentials.json')
@@ -122,8 +130,7 @@ def main():
     if not os.path.isfile(local_file_path):
         print(f"错误: 提供的路径不是一个有效的文件 -> '{local_file_path}'")
         return
-
-    # ... (路径构造部分保持不变) ...
+    
     device_name = socket.gethostname()
     path_without_drive = os.path.splitdrive(local_file_path)[1]
     path_parts = path_without_drive.strip(os.path.sep).split(os.path.sep)
@@ -145,12 +152,7 @@ def main():
 
         if not remote_file:
             print("远程文件不存在，执行上传操作。")
-            # ... (上传逻辑不变) ...
-            media = MediaFileUpload(local_file_path, resumable=True)
-            file_metadata = {'name': file_name, 'parents': [parent_folder_id]}
-            if media.mimetype() in MIME_TYPE_MAP:
-                file_metadata['mimeType'] = MIME_TYPE_MAP[media.mimetype()]
-            uploaded_file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
+            uploaded_file = create_drive_file(service, local_file_path, file_name, parent_folder_id)
             print(f"\n✅ 上传成功！\n   编辑链接: {uploaded_file.get('webViewLink')}")
             return
 
@@ -186,34 +188,38 @@ def main():
                     effective_direction = 'remote-to-local'
                     print("\n自动检测：云端文件较新或时间相同。")
 
+            # *** 主要改动点: 智能上传/更新逻辑 ***
             if effective_direction == 'local-to-remote' and local_mtime_utc > remote_mtime_utc:
-                print("执行上传覆盖云端文件...")
-                media = MediaFileUpload(local_file_path, resumable=True)
-                updated_file = service.files().update(fileId=remote_file.get('id'), media_body=media, fields='id, webViewLink').execute()
-                print(f"✅ 更新成功！\n   编辑链接: {updated_file.get('webViewLink')}")
+                if is_native_google_doc:
+                    print("检测到云端文件为原生Google格式，将执行“删除后重建”操作以更新...")
+                    print(f"  - 正在删除旧文件 (ID: {remote_file.get('id')})...")
+                    service.files().delete(fileId=remote_file.get('id')).execute()
+                    print("  - 正在上传新版本...")
+                    updated_file = create_drive_file(service, local_file_path, file_name, parent_folder_id)
+                    print(f"✅ 更新成功！文件已被重建。\n   新的编辑链接: {updated_file.get('webViewLink')}")
+                else:
+                    print("执行标准二进制文件更新...")
+                    media = MediaFileUpload(local_file_path, resumable=True)
+                    updated_file = service.files().update(fileId=remote_file.get('id'), media_body=media, fields='id, webViewLink').execute()
+                    print(f"✅ 更新成功！\n   编辑链接: {updated_file.get('webViewLink')}")
             
-            # *** 主要改动点: 智能下载/导出逻辑 ***
             elif effective_direction == 'remote-to-local' and remote_mtime_utc > local_mtime_utc:
+                # ... (下载/导出逻辑保持不变) ...
                 if is_native_google_doc:
                     remote_mime_type = remote_file.get('mimeType')
                     export_mime_type = GOOGLE_DOC_EXPORT_MAP.get(remote_mime_type)
-                    
                     if not export_mime_type:
                         print(f"\n❌ 下载失败！不支持将 '{remote_mime_type}' 导出为此类文件。")
                         return
-
                     print(f"检测到原生Google格式，将从 '{remote_mime_type}' 导出为 '{export_mime_type}'...")
                     request = service.files().export_media(fileId=remote_file.get('id'), mimeType=export_mime_type)
                 else:
                     print("执行标准下载...")
                     request = service.files().get_media(fileId=remote_file.get('id'))
-                
                 with io.FileIO(local_file_path, 'wb') as fh:
                     downloader = MediaIoBaseDownload(fh, request)
                     done = False
-                    while not done:
-                        status, done = downloader.next_chunk()
-                        print(f"  下载进度: {int(status.progress() * 100)}%", end='\r')
+                    while not done: status, done = downloader.next_chunk()
                 print("\n✅ 下载成功！本地文件已被更新。")
                 print(f"   云端文件链接: {remote_file.get('webViewLink')}")
             else:
