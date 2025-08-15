@@ -23,7 +23,16 @@ MIME_TYPE_MAP = {
     'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'application/vnd.google-apps.presentation',
 }
 
-# --- 辅助函数 get_drive_service, calculate_md5, get_or_create_folder_id, get_remote_path_id, get_default_config_dir 保持不变 ---
+# *** 新增：Google Docs 导出格式映射 ***
+# 定义原生 Google 格式应该被导出为什么样的二进制格式
+GOOGLE_DOC_EXPORT_MAP = {
+    'application/vnd.google-apps.document': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', # Google Doc -> .docx
+    'application/vnd.google-apps.spreadsheet': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',  # Google Sheet -> .xlsx
+    'application/vnd.google-apps.presentation': 'application/vnd.openxmlformats-officedocument.presentationml.presentation', # Google Slides -> .pptx
+}
+
+
+# --- 之前的辅助函数保持不变 ---
 def get_drive_service(credentials_path, token_path):
     creds = None
     if os.path.exists(token_path):
@@ -65,49 +74,36 @@ def get_remote_path_id(service, remote_path_parts):
             current_parent_id = get_or_create_folder_id(service, part, current_parent_id)
     return current_parent_id
 
+def find_remote_file(service, file_name, parent_folder_id):
+    base_name, extension = os.path.splitext(file_name)
+    if not extension or not base_name:
+        query = f"name = '{file_name}' and '{parent_folder_id}' in parents and trashed = false"
+    else:
+        query = f"(name = '{file_name}' or name = '{base_name}') and '{parent_folder_id}' in parents and trashed = false"
+    response = service.files().list(
+        q=query,
+        spaces='drive',
+        fields='files(id, name, md5Checksum, modifiedTime, webViewLink, mimeType)',
+        pageSize=10
+    ).execute()
+    files = response.get('files', [])
+    if not files: return None
+    if len(files) > 1:
+        for f in files:
+            if 'google-apps' in f.get('mimeType', ''): return f
+    return files[0]
+
 def get_default_config_dir():
     if platform.system() == "Darwin":
         return os.path.expanduser('~/Library/Mobile Documents/com~apple~CloudDocs/AppConfig/drive-sync')
     else:
         return os.path.expanduser('~/.config/drive-sync')
 
-# *** 主要改动点: find_remote_file 函数变得更智能 ***
-def find_remote_file(service, file_name, parent_folder_id):
-    """在指定父文件夹中智能查找文件，兼容文件名被转换的情况"""
-    base_name, extension = os.path.splitext(file_name)
-    
-    # 如果文件本身没有扩展名，或基础名为空，则只按全名搜索
-    if not extension or not base_name:
-        query = f"name = '{file_name}' and '{parent_folder_id}' in parents and trashed = false"
-    else:
-        # 否则，同时搜索 "file.ext" 和 "file"
-        # 使用 ' or ' 来组合查询条件
-        query = f"(name = '{file_name}' or name = '{base_name}') and '{parent_folder_id}' in parents and trashed = false"
-    
-    response = service.files().list(
-        q=query,
-        spaces='drive',
-        # 多请求一个 mimeType 字段用于判断
-        fields='files(id, name, md5Checksum, modifiedTime, webViewLink, mimeType)',
-        pageSize=10 # 请求多个以便后续筛选
-    ).execute()
-    files = response.get('files', [])
-    
-    if not files:
-        return None
-    
-    # 筛选逻辑：如果找到了多个文件（例如 a.xlsx 和 a），优先返回那个看起来被转换过的原生文件
-    if len(files) > 1:
-        for f in files:
-            if 'google-apps' in f.get('mimeType', ''):
-                return f # 优先返回原生Google文档
-    
-    return files[0] # 如果没找到原生文档或只有一个结果，返回第一个
-
 
 def main():
     """主执行函数"""
     parser = argparse.ArgumentParser(description="智能同步本地文件至 Google Drive", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    # ... (参数解析部分保持不变) ...
     parser.add_argument("local_path", help="要同步的本地文件路径")
     parser.add_argument("--base-path", default="/FileSync", help="云端存储的基础路径")
     parser.add_argument("--sync-direction", choices=['auto', 'local-to-remote', 'remote-to-local'], default='auto', help="同步方向")
@@ -127,6 +123,7 @@ def main():
         print(f"错误: 提供的路径不是一个有效的文件 -> '{local_file_path}'")
         return
 
+    # ... (路径构造部分保持不变) ...
     device_name = socket.gethostname()
     path_without_drive = os.path.splitdrive(local_file_path)[1]
     path_parts = path_without_drive.strip(os.path.sep).split(os.path.sep)
@@ -148,6 +145,7 @@ def main():
 
         if not remote_file:
             print("远程文件不存在，执行上传操作。")
+            # ... (上传逻辑不变) ...
             media = MediaFileUpload(local_file_path, resumable=True)
             file_metadata = {'name': file_name, 'parents': [parent_folder_id]}
             if media.mimetype() in MIME_TYPE_MAP:
@@ -157,12 +155,11 @@ def main():
             return
 
         print(f"远程文件已找到: '{remote_file.get('name')}', 开始进行比较...")
-        
-        # *** 主要改动点: 智能同步逻辑 ***
-        is_native_google_doc = 'md5Checksum' not in remote_file
+        is_native_google_doc = 'google-apps' in remote_file.get('mimeType', '')
         
         if is_native_google_doc:
             print("  - 检测到云端文件为原生Google格式，将跳过MD5比对。")
+            proceed_to_time_comparison = True
         else:
             local_md5 = calculate_md5(local_file_path)
             remote_md5 = remote_file.get('md5Checksum')
@@ -170,43 +167,58 @@ def main():
             if local_md5 == remote_md5:
                 print("\n✅ 文件内容完全一致，无需同步。")
                 print(f"   编辑链接: {remote_file.get('webViewLink')}")
-                return
-
-        print("正在比较修改时间...")
-        local_mtime_utc = datetime.fromtimestamp(os.path.getmtime(local_file_path), tz=timezone.utc)
-        remote_mtime_utc = datetime.fromisoformat(remote_file.get('modifiedTime').replace('Z', '+00:00'))
-        print(f"  - 本地文件修改时间 (UTC): {local_mtime_utc}\n  - 云端文件修改时间 (UTC): {remote_mtime_utc}")
-        
-        effective_direction = args.sync_direction
-        if effective_direction == 'auto':
-            if local_mtime_utc > remote_mtime_utc:
-                effective_direction = 'local-to-remote'
-                print("\n自动检测：本地文件较新。")
+                proceed_to_time_comparison = False
             else:
-                effective_direction = 'remote-to-local'
-                print("\n自动检测：云端文件较新或时间相同。")
+                proceed_to_time_comparison = True
 
-        if effective_direction == 'local-to-remote' and (is_native_google_doc or local_mtime_utc > remote_mtime_utc):
-            if not is_native_google_doc and local_mtime_utc <= remote_mtime_utc:
-                print(f"\n⏭️ 本地文件不是最新的，根据 '{args.sync_direction}' 规则，跳过操作。")
-            else:
+        if proceed_to_time_comparison:
+            print("正在比较修改时间...")
+            local_mtime_utc = datetime.fromtimestamp(os.path.getmtime(local_file_path), tz=timezone.utc)
+            remote_mtime_utc = datetime.fromisoformat(remote_file.get('modifiedTime').replace('Z', '+00:00'))
+            print(f"  - 本地文件修改时间 (UTC): {local_mtime_utc}\n  - 云端文件修改时间 (UTC): {remote_mtime_utc}")
+            
+            effective_direction = args.sync_direction
+            if effective_direction == 'auto':
+                if local_mtime_utc > remote_mtime_utc:
+                    effective_direction = 'local-to-remote'
+                    print("\n自动检测：本地文件较新。")
+                else:
+                    effective_direction = 'remote-to-local'
+                    print("\n自动检测：云端文件较新或时间相同。")
+
+            if effective_direction == 'local-to-remote' and local_mtime_utc > remote_mtime_utc:
                 print("执行上传覆盖云端文件...")
                 media = MediaFileUpload(local_file_path, resumable=True)
                 updated_file = service.files().update(fileId=remote_file.get('id'), media_body=media, fields='id, webViewLink').execute()
                 print(f"✅ 更新成功！\n   编辑链接: {updated_file.get('webViewLink')}")
-        elif effective_direction == 'remote-to-local' and (is_native_google_doc or remote_mtime_utc > local_mtime_utc):
-             if not is_native_google_doc and remote_mtime_utc <= local_mtime_utc:
-                print(f"\n⏭️ 云端文件不是最新的，根据 '{args.sync_direction}' 规则，跳过操作。")
-             else:
-                print("执行下载覆盖本地文件...")
-                request = service.files().get_media(fileId=remote_file.get('id'))
+            
+            # *** 主要改动点: 智能下载/导出逻辑 ***
+            elif effective_direction == 'remote-to-local' and remote_mtime_utc > local_mtime_utc:
+                if is_native_google_doc:
+                    remote_mime_type = remote_file.get('mimeType')
+                    export_mime_type = GOOGLE_DOC_EXPORT_MAP.get(remote_mime_type)
+                    
+                    if not export_mime_type:
+                        print(f"\n❌ 下载失败！不支持将 '{remote_mime_type}' 导出为此类文件。")
+                        return
+
+                    print(f"检测到原生Google格式，将从 '{remote_mime_type}' 导出为 '{export_mime_type}'...")
+                    request = service.files().export_media(fileId=remote_file.get('id'), mimeType=export_mime_type)
+                else:
+                    print("执行标准下载...")
+                    request = service.files().get_media(fileId=remote_file.get('id'))
+                
                 with io.FileIO(local_file_path, 'wb') as fh:
                     downloader = MediaIoBaseDownload(fh, request)
                     done = False
-                    while not done: status, done = downloader.next_chunk()
-                print(f"\n✅ 下载成功！本地文件已被更新。")
-        
-        print(f"   云端文件链接: {remote_file.get('webViewLink')}")
+                    while not done:
+                        status, done = downloader.next_chunk()
+                        print(f"  下载进度: {int(status.progress() * 100)}%", end='\r')
+                print("\n✅ 下载成功！本地文件已被更新。")
+                print(f"   云端文件链接: {remote_file.get('webViewLink')}")
+            else:
+                print(f"\n⏭️ 文件不是最新的，根据 '{args.sync_direction}' 规则，跳过操作。")
+                print(f"   云端文件链接: {remote_file.get('webViewLink')}")
 
     except HttpError as error:
         print(f"发生 API 错误: {error}")
