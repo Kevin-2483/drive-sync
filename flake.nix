@@ -40,6 +40,7 @@
             pythonPackages.google-api-python-client
             pythonPackages.google-auth-httplib2
             pythonPackages.google-auth-oauthlib
+            pythonPackages.rich
           ];
           
           meta = {
